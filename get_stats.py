@@ -16,9 +16,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 import requests
 from dotenv import load_dotenv
 import openai
-from openai import OpenAI
-from twelvelabs import TwelveLabs
+from openai import OpenAI, RateLimitError, AuthenticationError, PermissionDeniedError
+from twelvelabs import TwelveLabs, TooManyRequestsError
 from twelvelabs.tasks import TasksRetrieveResponse
+from twelvelabs.core.api_error import ApiError
 
 # ================== CONSTANTS ==================
 URL_1 = "https://api.tgstat.ru/channels/get"
@@ -35,8 +36,10 @@ with open('prompts/headers.json', 'r', encoding='utf-8') as f4:
 ADMIN_SPREADSHEET_NAME: str = "Sellebra TGstat (admin)"
 CHANNELS: str = 'Каналы'
 SUGGESTIONS: str ='Рекомендации'
+PROFILE: str = 'Профиль'
 MAIN: str = 'Main'
 LOG: str = 'Log'
+
 # ================== AUTH ==================
 load_dotenv()
 TGSTAT_API_KEY = os.getenv("TGSTAT_API_KEY")
@@ -52,7 +55,6 @@ scope = ['https://spreadsheets.google.com/feeds',
 creds = ServiceAccountCredentials.from_json_keyfile_name('creds.json', scope)
 gs_client = gspread.authorize(creds)
 
-# ================== FUNCTIONS ==================
 def get_or_create_worksheet(spreadsheet_name, title, rows=100, cols=20):
     try:
         return spreadsheet_name.worksheet(title)
@@ -60,32 +62,36 @@ def get_or_create_worksheet(spreadsheet_name, title, rows=100, cols=20):
         print(f"⚠️ Лист '{title}' не найден, создаю новый...")
         return spreadsheet_name.add_worksheet(title=title, rows=rows, cols=cols)
 
+# ================== GLOBAL VARIABLES ==================   
+admin_spreadsheet = gs_client.open(ADMIN_SPREADSHEET_NAME)
+admin_main = get_or_create_worksheet(admin_spreadsheet, MAIN)
+admin_log = get_or_create_worksheet(admin_spreadsheet, LOG)
+
+# ================== FUNCTIONS ==================
 def get_channel_info(channel_id):
     url = URL_1
     params = {
         'token': TGSTAT_API_KEY,
         'channelId': channel_id
     }
-    try:
-        response = requests.get(url, params=params, timeout=15).json()
-        if response.get("status", "") == "error":
-            raise Exception(response['error'])
-        ch = response.get("response", {})
-        return {
-            'Название канала': ch.get("title", ""),
-            'link': f"https://t.me/{ch.get('username', '')}" if ch.get("username") else channel_id,
-            'ID': ch.get("id", ""),
-            'Количество подписчиков': ch.get("participants_count", 0)
-        }
-    except Exception as e:
-        print(f"❌ Ошибка при обработке {channel_id}: {e}")
-        return None
+
+    response = requests.get(url, params=params, timeout=15).json()
+    if response.get("status", "") == "error":
+        raise Exception(response['error'])
+    ch = response.get("response", {})
+    return {
+        'Название канала': ch.get("title", ""),
+        'link': f"https://t.me/{ch.get('username', '')}" if ch.get("username") else channel_id,
+        'ID': ch.get("id", ""),
+        'Количество подписчиков': ch.get("participants_count", 0)
+    }
+
 
 def extract_channels_from_sheet(channels_worksheet):
     all_data = channels_worksheet.get_all_values()
     headers = all_data[0]
     data = all_data[1:]
-    link_col_index = headers.index("link")
+    link_col_index = headers.index("link") # TODO: make it a variable
     channels_list = []
     for row in data:
         if link_col_index < len(row):
@@ -94,12 +100,14 @@ def extract_channels_from_sheet(channels_worksheet):
                 channels_list.append(link)
     return channels_list
 
+
 def save_to_sheet_channels(data, worksheet):
     header = ["Название канала", "link", "ID", "Количество подписчиков"]
     rows = [[ch['Название канала'], ch['link'], ch['ID'], ch["Количество подписчиков"]] for ch in data]
     worksheet.clear()
     worksheet.append_row(header, value_input_option='RAW')
     worksheet.append_rows(rows, value_input_option='RAW')
+
 
 def get_top_posts(channel_id, days_back, limit=50):
     url = URL_2
@@ -117,8 +125,8 @@ def get_top_posts(channel_id, days_back, limit=50):
     try:
         return response.json().get("response", {}).get("items", [])
     except Exception as e:
-        print(f"Ошибка парсинга JSON для channel {channel_id}: {e}")
-        return []
+        raise Exception(f"Ошибка парсинга JSON для channel {channel_id}: {e}")
+
 
 def transform_to_normal_date(timestamp):
     try:
@@ -126,6 +134,7 @@ def transform_to_normal_date(timestamp):
         return dt.strftime("%d.%m.%Y"), dt.strftime("%H:%M")
     except:
         return "", ""
+
 
 def fetch_post_stats(post_link):
     url = URL_3
@@ -143,10 +152,12 @@ def fetch_post_stats(post_link):
         print(f"Exception for post {post_link}: {str(e)}")
     return None
 
+
 def calculate_engagement(views, reactions, comments, forwards):
     return round((reactions + forwards + comments) / views * 100, 2) if views > 0 else 0
 
-def extract_top_posts(channels_data, days_back, top_n):
+
+def extract_top_posts(company_id: int, company_name: str, channels_data, days_back, top_n):
     final_rows = []
     os.makedirs("extracted_data", exist_ok=True)
     
@@ -159,8 +170,8 @@ def extract_top_posts(channels_data, days_back, top_n):
         try:
             posts = get_top_posts(channel_id, days_back)
             if not posts:
-                print("Нет постов.")
-                continue
+                # Warning
+                raise Exception(f"Нет постов в канале")
                 
             # Collect posts for JSON
             all_posts.extend([{
@@ -229,35 +240,22 @@ def extract_top_posts(channels_data, days_back, top_n):
                     ch['Название канала'],
                     ch["Количество подписчиков"],
                     text,
-                    views,
                     post_link,
                     video_link,
-                    "",
-                    "",
                     date_only,
                     time_only,
-                    "",
-                    "",
                     post_length,
-                    "",
-                    "",
                     views,
                     reactions,
                     comments,
                     forwards,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    engagement,
-                    "",
-                    ""
+                    engagement
                 ]
                 final_rows.append(row)
                 
         except Exception as e:
-            print(f"Ошибка при обработке {ch['Название канала']}: {e}")
+            # Warning
+            admin_log.insert_row([company_id, company_name, f"Ошибка при обработке {channel_id}: {e}", datetime.today().isoformat()], 2)
     
     # Save posts to channels_stats.json
     with open("extracted_data/channels_stats.json", "w", encoding="utf-8") as f:
@@ -267,14 +265,8 @@ def extract_top_posts(channels_data, days_back, top_n):
     with open("extracted_data/posts_stats.json", "w", encoding="utf-8") as f:
         json.dump(all_stats, f, ensure_ascii=False, indent=2)
     
-    print(f"Всего выбрано постов: {len(final_rows)}")
     return final_rows
 
-def save_to_sheet_suggestions(rows, worksheet):
-    worksheet.clear()
-    worksheet.append_row(final_headers, value_input_option='RAW')
-    worksheet.append_rows(rows, value_input_option='RAW')
-    return worksheet
 
 def translate_into_russian(text):
     prompt = f"""
@@ -290,83 +282,19 @@ def translate_into_russian(text):
     )
     return response.choices[0].message.content
 
-def insert_ai_suggestions(rows, worksheet):
-    header = [
-        "Название канала",
-        "Количество подписчиков",
-        "Пост - Текст поста",
-        "Дата публикации",
-        "Количество просмотров",
-        "Ссылка на пост",
-        "Ссылка на видео",
-        "Предложение по посту",
-        "Предложение по видео"
-    ]
-    worksheet.clear()
-    worksheet.append_row(header, value_input_option='RAW')
-    worksheet.append_rows(rows, value_input_option='RAW')
-    
-# def generate_suggestions(channels_sheet, suggestions_sheet):
-
-#     records = channels_sheet.get_all_records()
-#     updated_rows = []
-
-#     for _, row in enumerate(records):
-#         print(f"🔍 Анализ поста: {row['Название канала']}")
-
-#         text = row.get("Пост - Текст поста", "")
-#         video_url = row.get("Ссылка на видео", "")
-
-#         # Обработка текста поста
-#         try:
-#             text_suggestion = rewrite_post_with_context(text)
-#         except Exception as e:
-#             print(f"❌ Ошибка в rewrite_post_with_context: {e}")
-#             text_suggestion = ""
-#             continue
-
-#         # Обработка видео
-#         try:
-#             if video_url:
-#                 video_suggestion = translate_into_russian(
-#                     transcribe_video(video_url))
-#             else:
-#                 video_suggestion = ""
-#         except Exception as e:
-#             print(f"❌ Ошибка в transcribe_video: {e}")
-#             video_suggestion = ""
-#             continue
-
-#         updated_row = [
-#             row["Название канала"],
-#             row["Количество подписчиков"],
-#             text,
-#             row["Дата публикации"],
-#             row["Количество просмотров"],
-#             row["Ссылка на пост"],
-#             video_url,
-#             text_suggestion,
-#             video_suggestion
-#         ]
-#         updated_rows.append(updated_row)
-#     insert_ai_suggestions(updated_rows, suggestions_sheet)
 
 def extract_json_from_response(content):
     """Extract JSON from markdown-wrapped content"""
     match = re.search(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if match:
-        json_str = match.group(1)
-        try:
+    try:
+        if match:
+            json_str = match.group(1)
             return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            print(f"Ошибка при парсинге JSON: {e}")
-            return None
-    else:
-        try:
+        else:
             return json.loads(content)
-        except json.JSONDecodeError as e:
-            print(f"Ошибка при попытке распарсить JSON без markdown: {e}")
-            return None
+    except json.JSONDecodeError as e:
+        raise Exception(f"Ошибка при парсинге JSON: {e}")
+
 
 def generate_index_name(url: str) -> str:
     """Generate unique index name based on video URL"""
@@ -375,35 +303,33 @@ def generate_index_name(url: str) -> str:
     name_hash = hashlib.md5(url.encode()).hexdigest()[:6]
     return f"video-index-{basename}-{name_hash}"
 
+
 def get_or_create_index(name: str):
     """Create the index (only if not exists)"""
-    existing = client2.index.list()
+    existing = client2.indexes.list()
     for idx in existing:
-        if idx.name == name:
-            print(f"✅ Using existing index: {idx.name}")
+        if idx.index_name == name:
+            print(f"✅ Используем существующий индекс: {idx.index_name}")
             return idx
 
-    models = [{"name": "pegasus1.2", "options": ["visual", "audio"]}]
-    index = client2.index.create(name=name, models=models)
-    print(f"✅ Index created: id={index.id}, name={index.name}")
+    models = [{"model_name": "pegasus1.2", "model_options": ["visual", "audio"]}]
+    index = client2.indexes.create(index_name=name, models=models)
+    print(f"✅ Индекс создан: id={index.id}")
     return index
 
+# TODO: remove function
 def download_video(url: str) -> str:
     """Download video from URL to temp file"""
-    print("📥 Downloading video...")
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
-            video_path = tmp_file.name
-            response = requests.get(url, stream=True, timeout=60)
-            response.raise_for_status()
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    tmp_file.write(chunk)
-        print(f"📁 Video saved to: {video_path}")
-        return video_path
-    except Exception as e:
-        print(f"❌ Error downloading video: {e}")
-        raise
+    print("📥 Загружаем видео...")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+        video_path = tmp_file.name
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                tmp_file.write(chunk)
+    print(f"📁 Видео сохранено в папку: {video_path}")
+    return video_path
 
 
 def transcribe_video(url: str) -> str:
@@ -412,11 +338,12 @@ def transcribe_video(url: str) -> str:
         return ""
 
     try:
-        video_path = download_video(url)
+        # video_path = download_video(url)
         index_name = generate_index_name(url)
         index = get_or_create_index(index_name)
 
-        task = client2.tasks.create(index_id=index.id, video_url=video_path)
+        # with open(video_path, "rb") as video_file:
+        task = client2.tasks.create(index_id=index.id, video_url=url)
         print(f"🚀 Task started: id={task.id}, video_id={task.video_id}")
 
         def on_task_update(task: TasksRetrieveResponse):
@@ -431,16 +358,21 @@ def transcribe_video(url: str) -> str:
         res = client2.summarize(video_id=task.video_id,
                                type="summary", prompt=PEGASUS_SYS_ROLE)
 
-        if os.path.exists(video_path):
-            os.remove(video_path)
+        # if os.path.exists(video_path):
+        #     os.remove(video_path)
 
         return res.summary
-
+    except ApiError as e:
+        error_body = getattr(e, 'body', {})
+        if isinstance(error_body, dict):
+            raise Exception(f"Ошибка TwelveLabs API: {error_body}")
+        raise Exception(f"Ошибка TwelveLabs API: {e}")
+    except TooManyRequestsError as e:
+        raise Exception("Ошибка TwelveLabs API: превышен лимит запросов")
     except Exception as e:
-        print(f"❌ Error transcribing video {url}: {e}")
-        if 'video_path' in locals() and os.path.exists(video_path):
-            os.remove(video_path)
-        return f"Error: {str(e)}"
+        # if 'video_path' in locals() and os.path.exists(video_path):
+        #     os.remove(video_path)
+        raise
 
 
 def rewrite_post_into_blocks(post_text):
@@ -464,19 +396,15 @@ def rewrite_post_into_blocks(post_text):
     Текст поста:
     \"\"\"{post_text}\"\"\"
     """
-    try:
-        response = client1.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "system", "content": OPENAI_SYS_ROLE},
-                      {"role": "user", "content": prompt}],
-            temperature=0.4
-        )
-        response_text = response.choices[0].message.content
+    response = client1.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "system", "content": OPENAI_SYS_ROLE},
+                    {"role": "user", "content": prompt}],
+        temperature=0.4
+    )
+    response_text = response.choices[0].message.content
 
-        return extract_json_from_response(response_text) or {}
-    except Exception as e:
-        print(f"Error analyzing post: {e}")
-        return {}
+    return extract_json_from_response(response_text)
 
 
 def rewrite_post_with_context(post_text, context):
@@ -489,27 +417,23 @@ def rewrite_post_with_context(post_text, context):
     Сохрани идею и пользу, но полностью перепиши текст под стиль ПрофКорм.
     Не упоминай чужие бренды. Пиши ясно, экспертно и по делу. Объём — до 2049 символов с пробелами.
     """
-    try:
-        response = client1.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "system", "content": OPENAI_SYS_ROLE},
-                      {"role": "user", "content": prompt}],
-            temperature=0.8
-        )
+    response = client1.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "system", "content": OPENAI_SYS_ROLE},
+                    {"role": "user", "content": prompt}],
+        temperature=0.8
+    )
 
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"Error rewriting post: {e}")
-        return ""
+    return response.choices[0].message.content
 
 
-def create_video_suggestion(transcription):
+def create_video_suggestion(transcription, company_context):
     """Create video suggestion based on transcription and context"""
     if not transcription or transcription.startswith("Error:"):
         return ""
 
     prompt = f"""
-    Контекст компании: {CONTEXT}
+    Контекст компании: {company_context}
     
     Ниже описание и скрипт видео конкурента:
     \"{transcription}\"
@@ -525,226 +449,252 @@ def create_video_suggestion(transcription):
     Сохрани структуру и эмоциональное воздействие оригинала, но адаптируй под наш стиль и аудиторию.
     """
 
-    try:
-        response = client1.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Ты креативный директор, который адаптирует видео-контент под бренд компании."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"❌ Error creating video suggestion: {e}")
-        return f"Базовая транскрипция: {transcription}"
+    response = client1.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "Ты креативный директор, который адаптирует видео-контент под бренд компании."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
+    )
+    return response.choices[0].message.content
 
 
-def complete_ai_analysis_for_sheet(worksheet, company_context):
+def complete_ai_analysis_for_sheet(company_id: int, company_name: str, company_context: str, post_num: int, worksheet):
     """Complete AI analysis for all posts in the sheet including video processing"""
-    try:
-        all_data = worksheet.get_all_values()
-        if not all_data:
-            print("❌ Лист пустой")
-            return
+    headers = worksheet.row_values(1)
+    new_data = worksheet.get_values(f"2:{post_num + 1}")
+    
+    post_text_col = headers.index("Пост - Текст поста")
+    video_url_col = headers.index(
+        "Ссылка на видео") if "Ссылка на видео" in headers else -1
 
-        headers = all_data[0]
-        rows = all_data[1:]
+    ai_columns = [
+        "Предложение по посту", "Предложение по видео", "Тема поста", "Формат",
+        "Стиль", "CTA", "Заголовок", "Длина заголовка",
+        "✅ Научный факт/исследование", "✅ Конкретная польза (как сделать)",
+        "✅ Призыв комментировать", "Инсайт/заметка", "Фильтр"
+    ]
 
-        try:
-            post_text_col = headers.index("Пост - Текст поста")
-            video_url_col = headers.index(
-                "Ссылка на видео") if "Ссылка на видео" in headers else -1
-        except ValueError:
-            print("❌ Колонка 'Пост - Текст поста' не найдена")
-            return
+    for col in ai_columns:
+        if col not in headers:
+            headers.append(col)
 
-        ai_columns = [
-            "Предложение по посту", "Предложение по видео", "Тема поста", "Формат",
-            "Стиль", "CTA", "Заголовок", "Длина заголовка",
-            "✅ Научный факт/исследование", "✅ Конкретная польза (как сделать)",
-            "✅ Призыв комментировать", "Инсайт/заметка", "Фильтр"
-        ]
+    if len(headers) > worksheet.col_count:
+        worksheet.add_cols(len(headers) - worksheet.col_count)
 
-        for col in ai_columns:
-            if col not in headers:
-                headers.append(col)
+    worksheet.update(range_name="1:1", values=[headers])
 
-        if len(headers) > worksheet.col_count:
-            worksheet.add_cols(len(headers) - worksheet.col_count)
+    admin_log.insert_row([company_id, company_name, f"🔄 Обрабатываем {post_num} строк с полным AI анализом...", datetime.today().isoformat()], 2)
 
-        worksheet.update("1:1", [headers])
+    enhanced_rows = []
+    for i, row in enumerate(new_data):
+        print(f"Обрабатываем строку {i+1}...")
 
-        print(f"🔄 Обрабатываем {len(rows)} строк с полным AI анализом...")
+        while len(row) < len(headers):
+            row.append("")
 
-        enhanced_rows = []
-        for i, row in enumerate(rows, start=2):
-            print(f"Обрабатываем строку {i}...")
+        post_text = row[post_text_col] if post_text_col < len(row) else ""
+        video_url = row[video_url_col] if video_url_col >= 0 and video_url_col < len(
+            row) else ""
 
-            while len(row) < len(headers):
-                row.append("")
-
-            post_text = row[post_text_col] if post_text_col < len(row) else ""
-            video_url = row[video_url_col] if video_url_col >= 0 and video_url_col < len(
-                row) else ""
-
-            if not post_text.strip():
-                enhanced_rows.append(row)
-                continue
-
-            # AI Analysis for text
-            print("📝 Анализируем текст поста...")
-            analysis = rewrite_post_into_blocks(post_text)
-            rewritten_post = rewrite_post_with_context(post_text, company_context)
-
-            # Video processing
-            video_suggestion = ""
-            if video_url.strip():
-                print(f"🎥 Обрабатываем видео: {video_url}")
-                try:
-                    transcription = transcribe_video(video_url.strip())
-                    if transcription and not transcription.startswith("Error:"):
-                        translated_transcription = translate_into_russian(
-                            transcription)
-                        video_suggestion = create_video_suggestion(
-                            translated_transcription)
-
-                    else:
-                        video_suggestion = "Ошибка обработки видео"
-                except Exception as e:
-                    print(f"  ❌ Ошибка обработки видео: {e}")
-                    video_suggestion = f"Ошибка: {str(e)}"
-
-            # Update row with all AI data
-            col_mapping = {
-                "Предложение по посту": rewritten_post,
-                "Предложение по видео": video_suggestion,
-                "Тема поста": analysis.get("tema", ""),
-                "Формат": analysis.get("format", ""),
-                "Стиль": analysis.get("style", ""),
-                "CTA": analysis.get("cta", ""),
-                "Заголовок": analysis.get("zagolovok_5_slov", ""),
-                "Длина заголовка": analysis.get("zagolovok_len", 0),
-                "✅ Научный факт/исследование": analysis.get("fact", ""),
-                "✅ Конкретная польза (как сделать)": analysis.get("benefit", ""),
-                "✅ Призыв комментировать": analysis.get("comment_call", ""),
-                "Инсайт/заметка": analysis.get("insight", ""),
-                "Фильтр": analysis.get("filter", "")
-            }
-
-            for col_name, value in col_mapping.items():
-                if col_name in headers:
-                    col_idx = headers.index(col_name)
-                    row[col_idx] = value
-
+        if not post_text.strip():
             enhanced_rows.append(row)
-            print(f"  ✅ Строка {i} обработана")
+            continue
+        
+        analysis = rewrite_post_into_blocks(post_text)
+        
+        rewritten_post = rewrite_post_with_context(post_text, company_context)
 
-        worksheet.update(f"2:{len(enhanced_rows)+1}", enhanced_rows)
+        # Video processing
+        video_suggestion = ""
+        if video_url.strip():
+            print(f"🎥 Обрабатываем видео: {video_url}")
+            try:
+                transcription = transcribe_video(video_url.strip())
+                if transcription:
+                    translated_transcription = translate_into_russian(
+                        transcription)
+                    video_suggestion = create_video_suggestion(
+                        translated_transcription, company_context)
+            except Exception as e:
+                admin_log.insert_row([company_id, company_name, f"Ошибка при обработке видео в посте {i+1}: {e}", datetime.today().isoformat()], 2)
 
-        print("✅ Полный AI анализ завершен для листа")
-        print(f"📊 Обработано строк: {len(enhanced_rows)}")
+        # Update row with all AI data
+        col_mapping = {
+            "Предложение по посту": rewritten_post,
+            "Предложение по видео": video_suggestion,
+            "Тема поста": analysis.get("tema", ""),
+            "Формат": analysis.get("format", ""),
+            "Стиль": analysis.get("style", ""),
+            "CTA": analysis.get("cta", ""),
+            "Заголовок": analysis.get("zagolovok_5_slov", ""),
+            "Длина заголовка": analysis.get("zagolovok_len", 0),
+            "✅ Научный факт/исследование": analysis.get("fact", ""),
+            "✅ Конкретная польза (как сделать)": analysis.get("benefit", ""),
+            "✅ Призыв комментировать": analysis.get("comment_call", ""),
+            "Инсайт/заметка": analysis.get("insight", ""),
+            "Фильтр": analysis.get("filter", "")
+        }
 
-    except Exception as e:
-        print(f"❌ Ошибка при полном AI анализе листа : {e}")
+        for col_name, value in col_mapping.items():
+            if col_name in headers:
+                col_idx = headers.index(col_name)
+                row[col_idx] = value
+
+        enhanced_rows.append(row)
+        print(f"  ✅ Строка {i+1} обработана")
+
+    worksheet.update(range_name=f"2:{post_num+1}", values=enhanced_rows)
+
+    print(f"✅ Полный AI анализ завершен для компании {company_name} c id {company_id}")
+    print(f"📊 Обработано строк: {len(enhanced_rows)}")
+
+async def extract_context(spreadsheet):
+    try:
+        worksheet = spreadsheet.worksheet(PROFILE)
+    except gspread.exceptions.WorksheetNotFound:
+        raise Exception(f"Нет листа {PROFILE}")
+
+    top_left_cell = worksheet.cell(1, 1).value
+    if not top_left_cell.strip():
+        raise Exception(f"Профиль компании должен быть указан на листе {PROFILE} в ячейке A1")
+    
+    return top_left_cell
 
 # ------------------ RUN ------------------
-async def process_table(file_url: str, company_context: str, days_back=60):
-    start_time = time.time()
-    print("🚀 Запуск анализа...")
+async def process_table(company_id: int, company_name: str, company_url: str, days_back=60):
+    print(f"🔄 Обрабатываем таблицу клиента {company_name} c id {company_id}...")
+    try:
+        try: 
+            spreadsheet = gs_client.open_by_url(company_url)
+        except:
+            raise Exception("Неверный URL")
+        company_context = await extract_context(spreadsheet)
+        # TODO: what if table not exist
+        channels_sheet = get_or_create_worksheet(spreadsheet, CHANNELS)
+        # TODO: what if table not exist
+        suggestions_sheet = get_or_create_worksheet(spreadsheet, SUGGESTIONS)
+        # TODO: should always update?
+        suggestions_headers = [
+            "Название канала",
+            "Количество подписчиков",
+            "Пост - Текст поста",
+            "Ссылка на пост",
+            "Ссылка на видео",
+            "Дата публикации",
+            "Время публикации",
+            "Длинна поста",
+            "Просмотры",
+            "Реакции",
+            "Комментарии",
+            "Репосты",
+            "Вовлеченность"
+        ]
+        suggestions_sheet.update(range_name='1:1', values=[suggestions_headers])
 
-    spreadsheet = gs_client.open_by_url(file_url)
-    channels_sheet = get_or_create_worksheet(spreadsheet, CHANNELS)
-    suggestions_sheet = get_or_create_worksheet(spreadsheet, SUGGESTIONS)
+        # --- Сбор информации о каналах ---
+        raw_channels = extract_channels_from_sheet(channels_sheet)
+        channel_infos = []
+        for ch in raw_channels:
+            try:
+                channel_id = ch.strip()
+                info = get_channel_info(channel_id)
+                if info:
+                    channel_infos.append(info)
+            except Exception as e:
+                # Warning
+                admin_log.insert_row([company_id, company_name, f"Ошибка при обработке {channel_id}: {e}", datetime.today().isoformat()], 2)
 
-    # --- Сбор информации о каналах ---
-    raw_channels = extract_channels_from_sheet(channels_sheet)
-    channel_infos = []
-    for ch in raw_channels:
-        info = get_channel_info(ch.strip())
-        if info:
-            channel_infos.append(info)
+        if not channel_infos:
+            raise Exception("Каналы не найдены")
 
-    # Сохраняем в Google Sheets
-    save_to_sheet_channels(channel_infos, channels_sheet)
+        # Сохраняем в Google Sheets
+        save_to_sheet_channels(channel_infos, channels_sheet)
 
-    # --- Сбор постов ---
-    channels_data = channels_sheet.get_all_records()
-    data = [ch for ch in channels_data if ch.get('ID') and ch.get('Название канала')]
-    rows = extract_top_posts(data, days_back, top_n=10)
+        # --- Логируем ---
+        admin_log.insert_row([company_id, company_name, f"Обработано {len(channel_infos)} каналов", datetime.today().isoformat()], 2)
 
-    # --- Сохраняем в Google Sheets ---
-    save_to_sheet_suggestions(rows, suggestions_sheet)
-    complete_ai_analysis_for_sheet(suggestions_sheet, company_context)
+        # --- Сбор постов ---
+        channels_data = channels_sheet.get_all_records()
+        data = [ch for ch in channels_data if ch.get('ID') and ch.get('Название канала')]
+        rows = extract_top_posts(company_id, company_name, data, days_back, top_n=10)
 
-    # --- Засечка времени ---
-    end_time = time.time()
-    elapsed = end_time - start_time
-    minutes, seconds = divmod(int(elapsed), 60)
-    print(f"\n🎉 Весь процесс AI анализа завершен!")
-    print(f"⏱️ Время выполнения: {minutes} мин {seconds} сек")
+        print(f"Всего выбрано постов: {len(rows)}")
 
+        if not rows:
+            raise Exception("Нет постов")
 
-async def create_client(i: int, client_name: str, client_url: str, admin_main, headers):
-    id_col = headers.index('id')
-    created_col = headers.index('created')
-    updated_col = headers.index('updated')
-    status_col = headers.index('status')
-    context_col = headers.index('company context')
+        # --- Сохраняем в Google Sheets ---
+        suggestions_sheet.insert_rows(rows, value_input_option='RAW', row=2)
 
-    # admin_main.update_cell(i+2, created_col+1, datetime.today().strftime('%Y-%m-%d'))
+        # --- Логируем ---
+        admin_log.insert_row([company_id, company_name, f"Собрано {len(rows)} рекомендаций", datetime.today().isoformat()], 2)
+
+        complete_ai_analysis_for_sheet(company_id, company_name, company_context, len(rows), suggestions_sheet)
+        
+        admin_log.insert_row([company_id, company_name, "AI анализ завершен", datetime.today().isoformat()], 2)
+ 
+    except PermissionDeniedError:
+        admin_log.insert_row([company_id, company_name, "Ошибка OpenAI API: включите VPN", datetime.today().isoformat()], 2)
+    except RateLimitError:
+        admin_log.insert_row([company_id, company_name, "Ошибка OpenAI API: исчерпан лимит запросов", datetime.today().isoformat()], 2)
+    except AuthenticationError:
+        admin_log.insert_row([company_id, company_name, "Ошибка OpenAI API: ошибка аутентификации", datetime.today().isoformat()], 2)
+    except Exception as e:
+        admin_log.insert_row([company_id, company_name, str(e), datetime.today().isoformat()], 2)
+
+def get_col_idx(col_name, headers):
+    try:
+        col_idx = headers.index(col_name.lower())
+    except ValueError:
+        raise Exception("Колонка '{col_name}' не найдена")
+    return col_idx
+
+async def create_client(i: int, company_id: int, company_name: str, company_url: str, headers):
+    created_col = get_col_idx('Created', headers)
+    updated_col = get_col_idx('Updated', headers)
+    status_col = get_col_idx('Status', headers)
+
+    admin_main.update_cell(i+2, created_col+1, datetime.today().strftime('%Y-%m-%d'))
     
-    company_id = admin_main.cell(i+2, id_col + 1).value
-    company_context = admin_main.cell(i+2, context_col+1).value
-    await process_table(client_url, company_context)
+    await process_table(company_id, company_name, company_url)
 
+    admin_main.update_cell(i+2, status_col+1, 'In progress')
     # admin_main.update_cell(i+2, updated_col+1, datetime.today().strftime('%Y-%m-%d'))
-    admin_main.update_cell(i+2, status_col+1, 'Start')
 
 def main():
-    admin_spreadsheet = gs_client.open(ADMIN_SPREADSHEET_NAME)
-    admin_main = get_or_create_worksheet(admin_spreadsheet, MAIN)
-    admin_log = get_or_create_worksheet(admin_spreadsheet, LOG)
-
-    
     all_data = admin_main.get_all_values()
     if not all_data:
-        print(f"❌ Лист '{MAIN}' пустой")
+        print(f"Лист '{MAIN}' пустой")
         return
 
     headers = [x.lower() for x in all_data[0]]
     rows = all_data[1:]
     
     try:
-        name_col = headers.index("name")
-    except ValueError:
-        print("❌ Колонка 'Name' не найдена")
-        return
+        id_col = get_col_idx('id', headers)
+        name_col = get_col_idx('Name', headers)
+        url_col = get_col_idx('URL', headers)
+        status_col = get_col_idx('Status', headers)
+
+        for i, row in enumerate(rows):
+            client_id = row[id_col].strip() if id_col < len(row) else ''
+            client_name = row[name_col].strip() if name_col < len(row) else ''
+            client_url = row[url_col].strip() if url_col < len(row) else ''
+            client_status = row[status_col].strip() if status_col < len(row) else ''
+
+            if client_status == 'Start':
+                if not client_id.isdigit():
+                    raise Exception(f"Неправильный id '{client_id}' для клиента в строке {i}")
+                client_id = int(client_id)
+                if client_name and client_url:
+                    asyncio.run(create_client(i, client_id, client_name, client_url, headers))
+                else:
+                    raise Exception(f"Не указано название или ссылка на таблицу для клиента в строке {i}")
     
-    try:
-        url_col = headers.index("url")
-    except ValueError:
-        print("❌ Колонка 'URL' не найдена")
-        return
-    
-    # status_columns = ['id', 'Status', 'Created', 'Updated', 'Comment']
-
-    # for col in status_columns:
-    #     if col.lower() not in headers:
-    #         headers.append(col)
-
-    #     if len(headers) > admin_main.col_count:
-    #         admin_main.add_cols(len(headers) - admin_main.col_count)
-
-    #     admin_main.update("1:1", [headers])
-
-    for i, row in enumerate(rows):
-        if name_col < len(row) and url_col < len(row):
-            client_name = row[name_col].strip()
-            client_url = row[url_col].strip()
-            if client_name and client_url:
-                asyncio.run(create_client(i, client_name, client_url, admin_main, headers))
-                
+    except Exception as e:
+        print(e)
         
 
 if __name__ == "__main__":
