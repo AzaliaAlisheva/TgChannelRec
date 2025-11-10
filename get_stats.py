@@ -21,6 +21,9 @@ from twelvelabs import TwelveLabs, TooManyRequestsError
 from twelvelabs.tasks import TasksRetrieveResponse
 from twelvelabs.core.api_error import ApiError
 
+import sys, logging
+from logging.handlers import RotatingFileHandler
+
 # ================== CONSTANTS ==================
 URL_1 = "https://api.tgstat.ru/channels/get"
 URL_2 = "https://api.tgstat.ru/channels/posts"
@@ -39,6 +42,30 @@ SUGGESTIONS: str ='Рекомендации'
 PROFILE: str = 'Профиль'
 MAIN: str = 'Main'
 LOG: str = 'Log'
+
+# ================== LOGGER ==================
+LOGGER_NAME = "analyse_admin"
+LOG_FILE = f"/var/log/{LOGGER_NAME}"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+# Инициализация отдельного логгера
+logger = logging.getLogger(LOGGER_NAME)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        fh = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")
+    except Exception as e:
+        fallback = f"/tmp/{LOGGER_NAME}.log"
+        print(f"[WARN] Не удалось открыть {LOG_FILE} для записи ({e}). Пишу в {fallback}")
+        fh = RotatingFileHandler(fallback, maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+logger.propagate = False
 
 # ================== AUTH ==================
 load_dotenv()
@@ -59,7 +86,7 @@ def get_or_create_worksheet(spreadsheet_name, title, rows=100, cols=20):
     try:
         return spreadsheet_name.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        print(f"⚠️ Лист '{title}' не найден, создаю новый...")
+        logger.warning(f"⚠️ Лист '{title}' не найден, создаю новый...")
         return spreadsheet_name.add_worksheet(title=title, rows=rows, cols=cols)
 
 # ================== GLOBAL VARIABLES ==================   
@@ -149,8 +176,7 @@ def fetch_post_stats(post_link):
         if data.get("status") == "ok":
             return data["response"]
     except Exception as e:
-        print(f"Exception for post {post_link}: {str(e)}")
-    return None
+        raise Exception(f"Exception for post {post_link}: {str(e)}")
 
 
 def calculate_engagement(views, reactions, comments, forwards):
@@ -165,7 +191,7 @@ def extract_top_posts(company_id: int, company_name: str, channels_data, days_ba
     all_stats = []
     
     for ch in channels_data:
-        print(f"\n🔍 Анализируем канал: {ch['Название канала']}")
+        logger.info(f"🔍 Анализируем канал: {ch['Название канала']}")
         channel_id = ch['ID']
         try:
             posts = get_top_posts(channel_id, days_back)
@@ -309,18 +335,18 @@ def get_or_create_index(name: str):
     existing = client2.indexes.list()
     for idx in existing:
         if idx.index_name == name:
-            print(f"✅ Используем существующий индекс: {idx.index_name}")
+            logger.info(f"✅ Используем существующий индекс: {idx.index_name}")
             return idx
 
     models = [{"model_name": "pegasus1.2", "model_options": ["visual", "audio"]}]
     index = client2.indexes.create(index_name=name, models=models)
-    print(f"✅ Индекс создан: id={index.id}")
+    logger.info(f"✅ Индекс создан: id={index.id}")
     return index
 
 # TODO: remove function
 def download_video(url: str) -> str:
     """Download video from URL to temp file"""
-    print("📥 Загружаем видео...")
+    logger.info("📥 Загружаем видео...")
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
         video_path = tmp_file.name
         response = requests.get(url, stream=True, timeout=60)
@@ -328,7 +354,7 @@ def download_video(url: str) -> str:
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 tmp_file.write(chunk)
-    print(f"📁 Видео сохранено в папку: {video_path}")
+    logger.info(f"📁 Видео сохранено в папку: {video_path}")
     return video_path
 
 
@@ -344,10 +370,10 @@ def transcribe_video(url: str) -> str:
 
         # with open(video_path, "rb") as video_file:
         task = client2.tasks.create(index_id=index.id, video_url=url)
-        print(f"🚀 Task started: id={task.id}, video_id={task.video_id}")
+        logger.info(f"🚀 Task started: id={task.id}, video_id={task.video_id}")
 
         def on_task_update(task: TasksRetrieveResponse):
-            print(f"⏳ Status = {task.status}")
+            logger.info(f"⏳ Status = {task.status}")
 
         task = client2.tasks.wait_for_done(task_id=task.id, callback=on_task_update)
 
@@ -489,7 +515,7 @@ def complete_ai_analysis_for_sheet(company_id: int, company_name: str, company_c
 
     enhanced_rows = []
     for i, row in enumerate(new_data):
-        print(f"Обрабатываем строку {i+1}...")
+        logger.info(f"Обрабатываем строку {i+1}...")
 
         while len(row) < len(headers):
             row.append("")
@@ -502,23 +528,46 @@ def complete_ai_analysis_for_sheet(company_id: int, company_name: str, company_c
             enhanced_rows.append(row)
             continue
         
+        start_time = time.time()
         analysis = rewrite_post_into_blocks(post_text)
+        end_time = time.time()
+
+        logger.info(f"Пост проанализирован за {end_time - start_time:.2f} секунд")
         
+        start_time = time.time()
         rewritten_post = rewrite_post_with_context(post_text, company_context)
+        end_time = time.time()
+
+        logger.info(f"Пост переписан за {end_time - start_time:.2f} секунд")
 
         # Video processing
         video_suggestion = ""
         if video_url.strip():
-            print(f"🎥 Обрабатываем видео: {video_url}")
+            logger.info(f"🎥 Обрабатываем видео: {video_url}")
             try:
+                start_time = time.time()
                 transcription = transcribe_video(video_url.strip())
+                end_time = time.time()
+
+                logger.info(f"Видео транскрибированно за {end_time - start_time:.2f} секунд")
+
                 if transcription:
+                    start_time = time.time()
                     translated_transcription = translate_into_russian(
                         transcription)
+                    end_time = time.time()
+
+                    logger.info(f"Транскрипт переведен за {end_time - start_time:.2f} секунд")
+
+                    start_time = time.time()
                     video_suggestion = create_video_suggestion(
                         translated_transcription, company_context)
+                    end_time = time.time()
+
+                    logger.info(f"Сгенерирован новый сюжет видео за {end_time - start_time:.2f} секунд")
             except Exception as e:
                 admin_log.insert_row([company_id, company_name, f"Ошибка при обработке видео в посте {i+1}: {e}", datetime.today().isoformat()], 2)
+                logger.warning(f"Ошибка при обработке видео в посте {i+1}: {e}")
 
         # Update row with all AI data
         col_mapping = {
@@ -543,12 +592,12 @@ def complete_ai_analysis_for_sheet(company_id: int, company_name: str, company_c
                 row[col_idx] = value
 
         enhanced_rows.append(row)
-        print(f"  ✅ Строка {i+1} обработана")
+        logger.info(f"  ✅ Строка {i+1} обработана")
 
     worksheet.update(range_name=f"2:{post_num+1}", values=enhanced_rows)
 
-    print(f"✅ Полный AI анализ завершен для компании {company_name} c id {company_id}")
-    print(f"📊 Обработано строк: {len(enhanced_rows)}")
+    logger.info(f"✅ Полный AI анализ завершен для компании {company_name} c id {company_id}")
+    logger.info(f"📊 Обработано строк: {len(enhanced_rows)}")
 
 async def extract_context(spreadsheet):
     try:
@@ -564,85 +613,77 @@ async def extract_context(spreadsheet):
 
 # ------------------ RUN ------------------
 async def process_table(company_id: int, company_name: str, company_url: str, days_back=60):
-    print(f"🔄 Обрабатываем таблицу клиента {company_name} c id {company_id}...")
-    try:
-        try: 
-            spreadsheet = gs_client.open_by_url(company_url)
-        except:
-            raise Exception("Неверный URL")
-        company_context = await extract_context(spreadsheet)
-        # TODO: what if table not exist
-        channels_sheet = get_or_create_worksheet(spreadsheet, CHANNELS)
-        # TODO: what if table not exist
-        suggestions_sheet = get_or_create_worksheet(spreadsheet, SUGGESTIONS)
-        # TODO: should always update?
-        suggestions_headers = [
-            "Название канала",
-            "Количество подписчиков",
-            "Пост - Текст поста",
-            "Ссылка на пост",
-            "Ссылка на видео",
-            "Дата публикации",
-            "Время публикации",
-            "Длинна поста",
-            "Просмотры",
-            "Реакции",
-            "Комментарии",
-            "Репосты",
-            "Вовлеченность"
-        ]
-        suggestions_sheet.update(range_name='1:1', values=[suggestions_headers])
+    logger.info(f"🔄 Обрабатываем таблицу клиента {company_name} c id {company_id}...")
+    try: 
+        spreadsheet = gs_client.open_by_url(company_url)
+    except:
+        raise Exception("Неверный URL")
+    company_context = await extract_context(spreadsheet)
+    # TODO: what if table not exist
+    channels_sheet = get_or_create_worksheet(spreadsheet, CHANNELS)
+    # TODO: what if table not exist
+    suggestions_sheet = get_or_create_worksheet(spreadsheet, SUGGESTIONS)
+    # TODO: should always update?
+    suggestions_headers = [
+        "Название канала",
+        "Количество подписчиков",
+        "Пост - Текст поста",
+        "Ссылка на пост",
+        "Ссылка на видео",
+        "Дата публикации",
+        "Время публикации",
+        "Длинна поста",
+        "Просмотры",
+        "Реакции",
+        "Комментарии",
+        "Репосты",
+        "Вовлеченность"
+    ]
+    suggestions_sheet.update(range_name='1:1', values=[suggestions_headers])
 
-        # --- Сбор информации о каналах ---
-        raw_channels = extract_channels_from_sheet(channels_sheet)
-        channel_infos = []
-        for ch in raw_channels:
-            try:
-                channel_id = ch.strip()
-                info = get_channel_info(channel_id)
-                if info:
-                    channel_infos.append(info)
-            except Exception as e:
-                # Warning
-                admin_log.insert_row([company_id, company_name, f"Ошибка при обработке {channel_id}: {e}", datetime.today().isoformat()], 2)
+    # --- Сбор информации о каналах ---
+    raw_channels = extract_channels_from_sheet(channels_sheet)
+    channel_infos = []
+    for ch in raw_channels:
+        try:
+            channel_id = ch.strip()
+            info = get_channel_info(channel_id)
+            if info:
+                channel_infos.append(info)
+        except Exception as e:
+            # Warning
+            admin_log.insert_row([company_id, company_name, f"Ошибка при обработке {channel_id}: {e}", datetime.today().isoformat()], 2)
 
-        if not channel_infos:
-            raise Exception("Каналы не найдены")
+    if not channel_infos:
+        raise Exception("Каналы не найдены")
 
-        # Сохраняем в Google Sheets
-        save_to_sheet_channels(channel_infos, channels_sheet)
+    # Сохраняем в Google Sheets
+    save_to_sheet_channels(channel_infos, channels_sheet)
 
-        # --- Логируем ---
-        admin_log.insert_row([company_id, company_name, f"Обработано {len(channel_infos)} каналов", datetime.today().isoformat()], 2)
+    # --- Логируем ---
+    admin_log.insert_row([company_id, company_name, f"Обработано {len(channel_infos)} каналов", datetime.today().isoformat()], 2)
 
-        # --- Сбор постов ---
-        channels_data = channels_sheet.get_all_records()
-        data = [ch for ch in channels_data if ch.get('ID') and ch.get('Название канала')]
-        rows = extract_top_posts(company_id, company_name, data, days_back, top_n=10)
+    # --- Сбор постов ---
+    channels_data = channels_sheet.get_all_records()
+    data = [ch for ch in channels_data if ch.get('ID') and ch.get('Название канала')]
+    rows = extract_top_posts(company_id, company_name, data, days_back, top_n=10)
 
-        print(f"Всего выбрано постов: {len(rows)}")
+    logger.info(f"Всего выбрано постов: {len(rows)}")
 
-        if not rows:
-            raise Exception("Нет постов")
+    if not rows:
+        raise Exception("Нет постов")
 
-        # --- Сохраняем в Google Sheets ---
-        suggestions_sheet.insert_rows(rows, value_input_option='RAW', row=2)
+    # --- Сохраняем в Google Sheets ---
+    suggestions_sheet.insert_rows(rows, value_input_option='RAW', row=2)
 
-        # --- Логируем ---
-        admin_log.insert_row([company_id, company_name, f"Собрано {len(rows)} рекомендаций", datetime.today().isoformat()], 2)
+    # --- Логируем ---
+    admin_log.insert_row([company_id, company_name, f"Собрано {len(rows)} рекомендаций", datetime.today().isoformat()], 2)
 
-        complete_ai_analysis_for_sheet(company_id, company_name, company_context, len(rows), suggestions_sheet)
-        
-        admin_log.insert_row([company_id, company_name, "AI анализ завершен", datetime.today().isoformat()], 2)
+    complete_ai_analysis_for_sheet(company_id, company_name, company_context, len(rows), suggestions_sheet)
+    
+    admin_log.insert_row([company_id, company_name, "AI анализ завершен", datetime.today().isoformat()], 2)
  
-    except PermissionDeniedError:
-        admin_log.insert_row([company_id, company_name, "Ошибка OpenAI API: включите VPN", datetime.today().isoformat()], 2)
-    except RateLimitError:
-        admin_log.insert_row([company_id, company_name, "Ошибка OpenAI API: исчерпан лимит запросов", datetime.today().isoformat()], 2)
-    except AuthenticationError:
-        admin_log.insert_row([company_id, company_name, "Ошибка OpenAI API: ошибка аутентификации", datetime.today().isoformat()], 2)
-    except Exception as e:
-        admin_log.insert_row([company_id, company_name, str(e), datetime.today().isoformat()], 2)
+    
 
 def get_col_idx(col_name, headers):
     try:
@@ -651,22 +692,22 @@ def get_col_idx(col_name, headers):
         raise Exception("Колонка '{col_name}' не найдена")
     return col_idx
 
-async def create_client(i: int, company_id: int, company_name: str, company_url: str, headers):
-    created_col = get_col_idx('Created', headers)
-    updated_col = get_col_idx('Updated', headers)
-    status_col = get_col_idx('Status', headers)
+# async def create_client(i: int, company_id: int, company_name: str, company_url: str, headers):
+#     created_col = get_col_idx('Created', headers)
+#     updated_col = get_col_idx('Updated', headers)
+#     status_col = get_col_idx('Status', headers)
 
-    admin_main.update_cell(i+2, created_col+1, datetime.today().strftime('%Y-%m-%d'))
+#     admin_main.update_cell(i+2, created_col+1, datetime.today().strftime('%Y-%m-%d'))
     
-    await process_table(company_id, company_name, company_url)
+#     await process_table(company_id, company_name, company_url)
 
-    admin_main.update_cell(i+2, status_col+1, 'In progress')
+#     admin_main.update_cell(i+2, status_col+1, 'In progress')
     # admin_main.update_cell(i+2, updated_col+1, datetime.today().strftime('%Y-%m-%d'))
 
 def main():
     all_data = admin_main.get_all_values()
     if not all_data:
-        print(f"Лист '{MAIN}' пустой")
+        logger.error(f"Лист '{MAIN}' пустой")
         return
 
     headers = [x.lower() for x in all_data[0]]
@@ -676,25 +717,66 @@ def main():
         id_col = get_col_idx('id', headers)
         name_col = get_col_idx('Name', headers)
         url_col = get_col_idx('URL', headers)
-        status_col = get_col_idx('Status', headers)
+        status_col = get_col_idx('Scheduler Status', headers)
+        processing_col = get_col_idx('Processing', headers)
+
+        clients_to_process = []
 
         for i, row in enumerate(rows):
             client_id = row[id_col].strip() if id_col < len(row) else ''
             client_name = row[name_col].strip() if name_col < len(row) else ''
             client_url = row[url_col].strip() if url_col < len(row) else ''
             client_status = row[status_col].strip() if status_col < len(row) else ''
+            
 
-            if client_status == 'Start':
+            if client_status == 'Start' or client_status == 'In progress':
                 if not client_id.isdigit():
-                    raise Exception(f"Неправильный id '{client_id}' для клиента в строке {i}")
+                    admin_log.insert_row([client_id, client_name, f"Неправильный id '{client_id}' для клиента в строке {i}", datetime.today().isoformat()], 2)
+                    logger.error(f"Неправильный id '{client_id}' для клиента в строке {i}")
+                    admin_main.update_cell(i+2, processing_col+1, 'Ошибка')
                 client_id = int(client_id)
                 if client_name and client_url:
-                    asyncio.run(create_client(i, client_id, client_name, client_url, headers))
+                    clients_to_process.append((i, client_id, client_name, client_url, client_status))
+                    admin_main.update_cell(i+2, processing_col+1, 'В ожидании...')
                 else:
-                    raise Exception(f"Не указано название или ссылка на таблицу для клиента в строке {i}")
+                    admin_log.insert_row([client_id, client_name, f"Не указано название или ссылка на таблицу для клиента в строке {i}", datetime.today().isoformat()], 2)
+                    logger.error(f"Не указано название или ссылка на таблицу для клиента в строке {i}")
+                    admin_main.update_cell(i+2, processing_col+1, 'Ошибка')
+        
+        for client in clients_to_process:
+            i, client_id, client_name, client_url, client_status = client 
+            admin_main.update_cell(i+2, processing_col+1, 'В исполнении')
+            try:
+                if client_status == 'Start':
+                    asyncio.run(process_table(client_id, client_name, client_url))
+                    admin_main.update_cell(i+2, status_col+1, 'In progress')
+                else:
+                    asyncio.run(process_table(client_id, client_name, client_url, 7))
+                admin_main.update_cell(i+2, processing_col+1, 'Готово')
+            except PermissionDeniedError:
+                admin_log.insert_row([client_id, client_name, "Ошибка OpenAI API: включите VPN", datetime.today().isoformat()], 2)
+                logger.error(f"Ошибка OpenAI API: включите VPN")
+                admin_main.update_cell(i+2, processing_col+1, 'Ошибка')
+            except RateLimitError:
+                admin_log.insert_row([client_id, client_name, "Ошибка OpenAI API: исчерпан лимит запросов", datetime.today().isoformat()], 2)
+                logger.error(f"Ошибка OpenAI API: исчерпан лимит запросов")
+                admin_main.update_cell(i+2, processing_col+1, 'Ошибка')
+            except AuthenticationError:
+                admin_log.insert_row([client_id, client_name, "Ошибка OpenAI API: ошибка аутентификации", datetime.today().isoformat()], 2)
+                logger.error(f"Ошибка OpenAI API: ошибка аутентификации")
+                admin_main.update_cell(i+2, processing_col+1, 'Ошибка')
+            except Exception as e:
+                admin_log.insert_row([client_id, client_name, str(e), datetime.today().isoformat()], 2)
+                logger.error(str(e))
+                admin_main.update_cell(i+2, processing_col+1, 'Ошибка')
+        
+        for client in clients_to_process:
+            i, client_id, client_name, client_url, client_status = client
+            if admin_main.cell(i+2, processing_col+1).value == 'Готово':
+                admin_main.update_cell(i+2, processing_col+1, '')
     
     except Exception as e:
-        print(e)
+        logger.error(str(e))
         
 
 if __name__ == "__main__":
